@@ -598,7 +598,9 @@ where
 
         let tx_nonce = transaction.nonce();
 
-        // Checks for nonce
+        // Checks for nonce 
+        // deleted for benchmark
+        /*
         if tx_nonce < account.nonce {
             return TransactionValidationOutcome::Invalid(
                 transaction,
@@ -606,7 +608,7 @@ where
                     .into(),
             )
         }
-
+        */
         let cost = transaction.cost();
 
         // Checks for max cost

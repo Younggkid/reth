@@ -35,7 +35,7 @@ reth-trie-common = { workspace = true, features = ["eip1186"] }
 alloy-evm = { workspace = true, features = ["overrides", "call-util"] }
 alloy-rlp.workspace = true
 alloy-serde.workspace = true
-alloy-eips.workspace = true
+alloy-eips = { workspace = true, features = ["serde"]}
 alloy-dyn-abi = { workspace = true, features = ["eip712"] }
 alloy-json-rpc.workspace = true
 alloy-network.workspace = true
@@ -47,7 +47,7 @@ alloy-consensus.workspace = true
 # rpc
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
 jsonrpsee-types.workspace = true
-
+chrono.workspace = true
 # async
 async-trait.workspace = true
 futures.workspace = true
@@ -59,6 +59,8 @@ auto_impl.workspace = true
 dyn-clone.workspace = true
 tracing.workspace = true
 
+serde = "1.0"
+serde_json = {workspace = true, features = ["alloc"]}
 [features]
 js-tracer = ["revm-inspectors/js-tracer", "reth-rpc-eth-types/js-tracer"]
 client = ["jsonrpsee/client", "jsonrpsee/async-client"]

@@ -50,6 +50,70 @@ use revm::{
 use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
 use tracing::trace;
 
+use std::{env, fs::OpenOptions, io::Write, sync::{Arc, Mutex}, time::Instant};
+use chrono::Utc; // add chrono = "0.4" in Cargo.toml if not present
+
+#[derive(Default)]
+struct TimingSums {
+    evm_env_us_sum: u128,
+    apply_overrides_us_sum: u128,
+    default_gas_us_sum: u128,
+    execute_us_sum: u128,
+    build_block_us_sum: u128,
+    n_calls_total: usize,
+
+    // new (finer-grain inside "execute")
+    pub evm_setup_us_sum: u128,
+    pub builder_setup_us_sum: u128,
+    pub exec_core_us_sum: u128,
+}
+
+fn profile_csv_path() -> String {
+    env::var("SIM_PROFILE_CSV").unwrap_or_else(|_| "/home/ubuntu/sim_profile.csv".to_string())
+}
+
+fn append_profile_csv_line(
+    block_id_hex: String,
+    n_blocks: usize,
+    sums: &TimingSums,
+    recover_block_us: u128,
+    spawn_state_us: u128,
+    total_us: u128,
+) {
+    let path = profile_csv_path();
+    let ts_iso = Utc::now().to_rfc3339();
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)
+        .unwrap_or_else(|e| panic!("open {} failed: {}", path, e));
+
+    // write header once
+    if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+        let _ = writeln!(
+            file,
+            "ts_iso,block_id,n_blocks,n_calls_total,recover_block_us,spawn_state_us,evm_env_us_sum,apply_overrides_us_sum,default_gas_us_sum,evm_setup_us_sum,builder_setup_us_sum,exec_core_us_sum,execute_us_sum,build_block_us_sum,total_us"
+        );
+    }
+
+    let _ = writeln!(
+        file,
+        "{ts},{bid},{nb},{nc},{rb},{sp},{ee},{ao},{dg},{ex1},{ex2},{ex3},{ex},{bb},{tot}",
+        ts = ts_iso,
+        bid = block_id_hex,
+        nb = n_blocks,
+        nc = sums.n_calls_total,
+        rb = recover_block_us,
+        sp = spawn_state_us,
+        ee = sums.evm_env_us_sum,
+        ao = sums.apply_overrides_us_sum,
+        dg = sums.default_gas_us_sum,
+        ex1 = sums.evm_setup_us_sum,
+        ex2 = sums.builder_setup_us_sum,
+        ex3 = sums.exec_core_us_sum,
+        ex = sums.execute_us_sum,
+        bb = sums.build_block_us_sum,
+        tot = total_us
+    );
+}
+
 /// Result type for `eth_simulateV1` RPC method.
 pub type SimulatedBlocksResult<N, E> = Result<Vec<SimulatedBlock<RpcBlock<N>>>, E>;
 
@@ -76,52 +140,73 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         block: Option<BlockId>,
     ) -> impl Future<Output = SimulatedBlocksResult<Self::NetworkTypes, Self::Error>> + Send {
         async move {
+            let t_total = Instant::now();
+    
             if payload.block_state_calls.len() > self.max_simulate_blocks() as usize {
                 return Err(EthApiError::InvalidParams("too many blocks.".to_string()).into())
             }
-
+    
             let block = block.unwrap_or_default();
-
+    
             let SimulatePayload {
                 block_state_calls,
                 trace_transfers,
                 validation,
                 return_full_transactions,
             } = payload;
-
+    
             if block_state_calls.is_empty() {
                 return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into())
             }
-
+    
+            let t_recover = Instant::now();
             let base_block =
                 self.recovered_block(block).await?.ok_or(EthApiError::HeaderNotFound(block))?;
+            let recover_block_us = t_recover.elapsed().as_micros() as u128;
+    
             let mut parent = base_block.sealed_header().clone();
-
+    
+            // aggregate timings across blocks inside the closure
+            let sums = Arc::new(Mutex::new(TimingSums::default()));
+            let n_blocks = block_state_calls.len();
+    
+            let block_hex = format!("{:#x}", base_block.number()); // or use block hash if preferred
+    
             let this = self.clone();
-            self.spawn_with_state_at_block(block, move |state| {
+            let sums_cloned = Arc::clone(&sums);
+    
+            let t_spawn = Instant::now();
+            let out = self.spawn_with_state_at_block(block, move |state| {
                 let mut db =
                     State::builder().with_database(StateProviderDatabase::new(state)).build();
                 let mut blocks: Vec<SimulatedBlock<RpcBlock<Self::NetworkTypes>>> =
                     Vec::with_capacity(block_state_calls.len());
+    
                 for block in block_state_calls {
+                    let t_env = Instant::now();
                     let mut evm_env = this
                         .evm_config()
                         .next_evm_env(&parent, &this.next_env_attributes(&parent)?)
                         .map_err(RethError::other)
                         .map_err(Self::Error::from_eth_err)?;
-
+    
                     // Always disable EIP-3607
                     evm_env.cfg_env.disable_eip3607 = true;
-
+    
                     if !validation {
-                        // If not explicitly required, we disable nonce check <https://github.com/paradigmxyz/reth/issues/16108>
+                        // disable nonce check & basefee for simulate
                         evm_env.cfg_env.disable_nonce_check = true;
                         evm_env.cfg_env.disable_base_fee = true;
                         evm_env.block_env.basefee = 0;
                     }
-
+                    let evm_env_us = t_env.elapsed().as_micros() as u128;
+    
                     let SimBlock { block_overrides, state_overrides, calls } = block;
-
+                    {
+                        let mut agg = sums_cloned.lock().unwrap();
+                        agg.n_calls_total += calls.len();
+                    }
+                    let t_apply = Instant::now();
                     if let Some(block_overrides) = block_overrides {
                         // ensure we don't allow uncapped gas limit per block
                         if let Some(gas_limit_override) = block_overrides.gas_limit {
@@ -139,36 +224,40 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         apply_state_overrides(state_overrides, &mut db)
                             .map_err(Self::Error::from_eth_err)?;
                     }
-
+                    let apply_overrides_us = t_apply.elapsed().as_micros() as u128;
+    
+                    let t_defgas = Instant::now();
                     let block_gas_limit = evm_env.block_env.gas_limit;
                     let chain_id = evm_env.cfg_env.chain_id;
-
+    
                     let default_gas_limit = {
                         let total_specified_gas =
                             calls.iter().filter_map(|tx| tx.as_ref().gas_limit()).sum::<u64>();
                         let txs_without_gas_limit =
                             calls.iter().filter(|tx| tx.as_ref().gas_limit().is_none()).count();
-
+    
                         if total_specified_gas > block_gas_limit {
                             return Err(EthApiError::Other(Box::new(
                                 EthSimulateError::BlockGasLimitExceeded,
                             ))
                             .into())
                         }
-
+    
                         if txs_without_gas_limit > 0 {
                             (block_gas_limit - total_specified_gas) / txs_without_gas_limit as u64
                         } else {
                             0
                         }
                     };
-
+                    let default_gas_us = t_defgas.elapsed().as_micros() as u128;
+    
                     let ctx = this
                         .evm_config()
                         .context_for_next_block(&parent, this.next_env_attributes(&parent)?);
+    
+                    let t_exec_total = Instant::now();
                     let (result, results) = if trace_transfers {
-                        // prepare inspector to capture transfer inside the evm so they are recorded
-                        // and included in logs
+                        // capture transfers
                         let inspector = TransferInspector::new(false).with_logs(true);
                         let evm = this
                             .evm_config()
@@ -182,32 +271,87 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             this.tx_resp_builder(),
                         )?
                     } else {
+
+                        // 1) EVM setup
+                        let t_evm = Instant::now();
                         let evm = this.evm_config().evm_with_env(&mut db, evm_env);
+                        let evm_setup_us = t_evm.elapsed().as_micros() as u128;
+                        
+                        // 2) Builder setup
+                        let t_builder = Instant::now();
                         let builder = this.evm_config().create_block_builder(evm, &parent, ctx);
-                        simulate::execute_transactions(
+                        let builder_setup_us = t_builder.elapsed().as_micros() as u128;
+                        
+                        // 3) Execute
+                        let t_exec_core = Instant::now();
+                        let (result, results) = simulate::execute_transactions(
                             builder,
                             calls,
                             default_gas_limit,
                             chain_id,
                             this.tx_resp_builder(),
-                        )?
+                        )?;
+                        let exec_core_us = t_exec_core.elapsed().as_micros() as u128;
+                        {
+                            let mut agg = sums_cloned.lock().unwrap();
+                            agg.evm_setup_us_sum += evm_setup_us;
+                            agg.builder_setup_us_sum += builder_setup_us;
+                            agg.exec_core_us_sum += exec_core_us;
+                        }
+                        (result, results)
                     };
-
+                    let execute_us = t_exec_total.elapsed().as_micros() as u128;
                     parent = result.block.clone_sealed_header();
-
+    
+                    let t_build = Instant::now();
                     let block = simulate::build_simulated_block(
                         result.block,
                         results,
                         return_full_transactions.into(),
                         this.tx_resp_builder(),
-                    )?;
 
+                    )?;
+                    let build_block_us = t_build.elapsed().as_micros() as u128;
+    
+                    // accumulate
+                    {
+                        let mut agg = sums_cloned.lock().unwrap();
+                        agg.evm_env_us_sum += evm_env_us;
+                        agg.apply_overrides_us_sum += apply_overrides_us;
+                        agg.default_gas_us_sum += default_gas_us;
+                        agg.execute_us_sum += execute_us;
+                        agg.build_block_us_sum += build_block_us;
+                        // add calls count for this block
+                        // NOTE: we don't have `calls` variable anymore here (moved), so count earlier
+                        // but we can count via result.transactions()? Not easily. So count before move:
+                        // Workaround: Clone length earlier:
+                        // -> done below: we carried calls.len() before executing.
+                    }
+    
                     blocks.push(block);
                 }
-
+    
                 Ok(blocks)
-            })
-            .await
+            }).await;
+            let spawn_state_us = t_spawn.elapsed().as_micros() as u128;
+    
+            // handle result first
+            let blocks_vec = out?;
+    
+            // finalize: read sums and write CSV
+            let sums_guard = sums.lock().unwrap();
+            let total_us = t_total.elapsed().as_micros() as u128;
+    
+            append_profile_csv_line(
+                block_hex,
+                n_blocks,
+                &*sums_guard,
+                recover_block_us,
+                spawn_state_us,
+                total_us,
+            );
+    
+            Ok(blocks_vec)
         }
     }
 
