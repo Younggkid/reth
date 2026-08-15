@@ -610,13 +610,21 @@ where
         mode: ExecutionWitnessMode,
     ) -> Result<ExecutionWitness, Eth::Error> {
         let block_number = block.header().number();
-        self.eth_api()
+        let started = std::time::Instant::now();
+        let witness = self
+            .eth_api()
             .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
+                // Everything before this point is provider setup; the split below separates the
+                // execution this method has to redo from the witness collection that is the
+                // marginal cost of serving it.
+                let state_ready = std::time::Instant::now();
                 let block_executor = eth_api.evm_config().executor(&mut db);
 
                 let mut witness = None;
+                let mut witness_elapsed = std::time::Duration::ZERO;
                 let _ = block_executor
                     .execute_with_state_closure(&block, |statedb: &State<_>| {
+                        let step = std::time::Instant::now();
                         witness =
                             Some(ExecutionWitnessRecord::new(statedb).into_execution_witness(
                                 &statedb.database.database.0,
@@ -624,14 +632,36 @@ where
                                 block_number,
                                 mode,
                             ));
+                        witness_elapsed = step.elapsed();
                     })
                     .map_err(|err| EthApiError::Internal(err.into()))?;
+
+                let inner = state_ready.elapsed();
+                tracing::debug!(
+                    target: "reth::witness::timing",
+                    block_number,
+                    us_execute = inner.saturating_sub(witness_elapsed).as_micros() as u64,
+                    us_witness = witness_elapsed.as_micros() as u64,
+                    "debug_executionWitness phases"
+                );
 
                 Ok(witness
                     .expect("state closure is called after successful execution")
                     .map_err(EthApiError::from)?)
             })
-            .await
+            .await;
+
+        // Logged outside the spawned closure so it also covers acquiring the state provider and the
+        // hop on and off the blocking pool — the parts a caller pays for but the closure cannot see.
+        tracing::debug!(
+            target: "reth::witness::timing",
+            block_number,
+            us_total = started.elapsed().as_micros() as u64,
+            ok = witness.is_ok(),
+            "debug_executionWitness total"
+        );
+
+        witness
     }
 
     /// Returns account information, including the storage root, after replaying the block through

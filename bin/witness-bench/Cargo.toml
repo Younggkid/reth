@@ -1,0 +1,61 @@
+[package]
+name = "witness-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Measures the marginal cost of attaching an execution witness to a block"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-chainspec.workspace = true
+reth-cli-commands.workspace = true
+reth-consensus.workspace = true
+reth-consensus-common.workspace = true
+reth-db.workspace = true
+reth-node-types.workspace = true
+reth-ethereum-cli.workspace = true
+reth-ethereum-consensus.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm.workspace = true
+reth-evm-ethereum.workspace = true
+reth-execution-types.workspace = true
+reth-node-ethereum.workspace = true
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+reth-revm.workspace = true
+reth-stages-types.workspace = true
+reth-storage-api.workspace = true
+reth-tracing.workspace = true
+reth-trie.workspace = true
+reth-tasks.workspace = true
+reth-trie-common.workspace = true
+
+# alloy
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-eth = { workspace = true, features = ["serde"] }
+alloy-rpc-types-debug.workspace = true
+alloy-rpc-types-engine.workspace = true
+alloy-rlp.workspace = true
+
+# misc
+clap = { workspace = true, features = ["derive", "env"] }
+eyre.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+tracing.workspace = true
+zstd.workspace = true
+reqwest = { workspace = true, features = ["json", "blocking"] }
+
+[[bin]]
+name = "witness-bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "witness-engine"
+path = "src/engine_main.rs"

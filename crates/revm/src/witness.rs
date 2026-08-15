@@ -3,6 +3,70 @@ use alloy_primitives::{keccak256, Bytes, B256};
 use reth_trie::{ExecutionWitnessMode, HashedPostState, HashedStorage};
 use revm::database::State;
 
+/// Wall time and page-fault deltas for the steps inside witness generation.
+///
+/// Major page faults are the useful signal here: reth's database is memory-mapped, so a read that
+/// misses the page cache surfaces as a major fault rather than as a syscall. Counting them per step
+/// separates the work that touches disk from the work that is pure CPU, which wall time alone
+/// cannot do — a cold trie walk and a warm one differ by two orders of magnitude with identical
+/// instruction counts.
+///
+/// Collection is off unless `RETH_WITNESS_TIMING` is set, because reading `/proc` costs a few
+/// microseconds per sample and the cheapest steps here run in tens of microseconds.
+#[cfg(all(feature = "witness", feature = "std"))]
+#[derive(Debug, Default, Clone, Copy)]
+struct StepMeter {
+    elapsed: core::time::Duration,
+    major_faults: u64,
+    minor_faults: u64,
+}
+
+#[cfg(all(feature = "witness", feature = "std"))]
+struct StepGuard {
+    start: std::time::Instant,
+    faults: (u64, u64),
+}
+
+#[cfg(all(feature = "witness", feature = "std"))]
+impl StepGuard {
+    fn start() -> Self {
+        Self { start: std::time::Instant::now(), faults: thread_faults() }
+    }
+
+    fn stop(self) -> StepMeter {
+        let elapsed = self.start.elapsed();
+        let (minor, major) = thread_faults();
+        StepMeter {
+            elapsed,
+            major_faults: major.saturating_sub(self.faults.1),
+            minor_faults: minor.saturating_sub(self.faults.0),
+        }
+    }
+}
+
+/// Returns `(minor, major)` fault counts for the calling thread, or zeros when disabled.
+///
+/// Reads `/proc/thread-self/stat`, whose `comm` field can itself contain spaces and parentheses;
+/// splitting on the last `)` is the only reliable way to find the numeric tail. In that tail
+/// `minflt` is index 7 and `majflt` index 9.
+#[cfg(all(feature = "witness", feature = "std"))]
+fn thread_faults() -> (u64, u64) {
+    if !timing_enabled() {
+        return (0, 0);
+    }
+    let Ok(stat) = std::fs::read_to_string("/proc/thread-self/stat") else { return (0, 0) };
+    let Some((_, tail)) = stat.rsplit_once(')') else { return (0, 0) };
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    let field = |index: usize| fields.get(index).and_then(|v| v.parse().ok()).unwrap_or(0);
+    (field(7), field(9))
+}
+
+#[cfg(all(feature = "witness", feature = "std"))]
+fn timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RETH_WITNESS_TIMING").is_some())
+}
+
 /// Borrows finalized execution state for witness generation.
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutionWitnessRecord<'a, DB> {
@@ -37,6 +101,7 @@ impl<'a, DB> ExecutionWitnessRecord<'a, DB> {
         HP: reth_storage_api::HeaderProvider + ?Sized,
         HP::Header: alloy_rlp::Encodable,
     {
+        let step = StepGuard::start();
         let codes = match mode {
             ExecutionWitnessMode::Legacy => self
                 .state
@@ -66,12 +131,20 @@ impl<'a, DB> ExecutionWitnessRecord<'a, DB> {
             }
         };
 
-        let (hashed_state, keys) = self.hashed_post_state(state_provider)?;
+        let m_codes = step.stop();
 
+        let mut m_hash = StepMeter::default();
+        let mut m_expand = StepMeter::default();
+        let (hashed_state, keys) =
+            self.hashed_post_state_timed(state_provider, &mut m_hash, &mut m_expand)?;
+
+        let step = StepGuard::start();
         let state = state_provider.witness(Default::default(), hashed_state, mode)?;
+        let m_trie = step.stop();
         let mut exec_witness =
             alloy_rpc_types_debug::ExecutionWitness { state, codes, keys, ..Default::default() };
 
+        let step = StepGuard::start();
         let lowest_block_number =
             self.state.block_hashes.lowest().map(|(block_number, _)| block_number);
         let smallest = lowest_block_number.unwrap_or_else(|| block_number.saturating_sub(1));
@@ -86,18 +159,50 @@ impl<'a, DB> ExecutionWitnessRecord<'a, DB> {
                 buf.into()
             })
             .collect();
+        let m_headers = step.stop();
+
+        // One event per witness, at debug level so a normal node never pays for it. `trie` is the
+        // only step that walks the database; the rest are memory or CPU, so a large `*_major` on
+        // any other step means something unexpected is faulting.
+        tracing::debug!(
+            target: "reth::witness::timing",
+            block_number,
+            nodes = exec_witness.state.len(),
+            codes = exec_witness.codes.len(),
+            keys = exec_witness.keys.len(),
+            headers = exec_witness.headers.len(),
+            us_codes = m_codes.elapsed.as_micros() as u64,
+            us_hash = m_hash.elapsed.as_micros() as u64,
+            us_expand = m_expand.elapsed.as_micros() as u64,
+            us_trie = m_trie.elapsed.as_micros() as u64,
+            us_headers = m_headers.elapsed.as_micros() as u64,
+            major_codes = m_codes.major_faults,
+            major_hash = m_hash.major_faults,
+            major_expand = m_expand.major_faults,
+            major_trie = m_trie.major_faults,
+            major_headers = m_headers.major_faults,
+            minor_trie = m_trie.minor_faults,
+            "execution witness generated"
+        );
 
         Ok(exec_witness)
     }
 
+    /// Builds the witness target, reporting how long the local hashing and the provider's
+    /// expansion took separately. The first is pure keccak over touched keys; the second can read
+    /// the database, because destroyed accounts need their untouched slots expanded from the parent
+    /// state.
     #[cfg(feature = "witness")]
-    fn hashed_post_state<SP>(
+    fn hashed_post_state_timed<SP>(
         &self,
         state_provider: &SP,
+        hash_meter: &mut StepMeter,
+        expand_meter: &mut StepMeter,
     ) -> reth_storage_errors::provider::ProviderResult<(HashedPostState, Vec<Bytes>)>
     where
         SP: reth_storage_api::HashedPostStateProvider + ?Sized,
     {
+        let step = StepGuard::start();
         let mut hashed_state = HashedPostState::default();
         let mut keys = Vec::new();
         for (address, account) in &self.state.cache.accounts {
@@ -127,7 +232,12 @@ impl<'a, DB> ExecutionWitnessRecord<'a, DB> {
         // The execution cache does not contain untouched slots of a destroyed account. The
         // provider expands them into explicit zero writes from the parent state; extending it last
         // also ensures the bundle's final values override those collected from the cache.
+        *hash_meter = step.stop();
+
+        let step = StepGuard::start();
         hashed_state.extend(state_provider.hashed_post_state(&self.state.bundle_state)?);
+        *expand_meter = step.stop();
+
         Ok((hashed_state, keys))
     }
 }
@@ -181,8 +291,9 @@ mod tests {
             )]),
         );
 
-        let (hashed_state, _) =
-            ExecutionWitnessRecord::new(&state).hashed_post_state(&provider).unwrap();
+        let (hashed_state, _) = ExecutionWitnessRecord::new(&state)
+            .hashed_post_state_timed(&provider, &mut Default::default(), &mut Default::default())
+            .unwrap();
         let storage = hashed_state.storages.get(&hashed_address).unwrap();
         assert!(!storage.wiped);
         assert_eq!(storage.storage.get(&hashed_slot), Some(&U256::ZERO));
