@@ -534,23 +534,59 @@ where
         mode: ExecutionWitnessMode,
     ) -> Result<ExecutionWitness, Eth::Error> {
         let block_number = block.header().number();
-        self.eth_api()
+        let started = std::time::Instant::now();
+        let witness = self
+            .eth_api()
             .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
+                // Everything before this point is provider setup; the split below separates the
+                // execution this method has to redo from the witness collection that is the
+                // marginal cost of serving it.
+                let state_ready = std::time::Instant::now();
                 let block_executor = eth_api.evm_config().executor(&mut db);
 
                 let mut witness_record = ExecutionWitnessRecord::default();
 
+                let mut record_elapsed = std::time::Duration::ZERO;
                 let _ = block_executor
                     .execute_with_state_closure(&block, |statedb: &State<_>| {
+                        let step = std::time::Instant::now();
                         witness_record.record_executed_state(statedb, mode);
+                        record_elapsed = step.elapsed();
                     })
                     .map_err(|err| EthApiError::Internal(err.into()))?;
+                let execute_elapsed = state_ready.elapsed().saturating_sub(record_elapsed);
 
-                Ok(witness_record
+                let step = std::time::Instant::now();
+                let witness = witness_record
                     .into_execution_witness(&db.database.0, eth_api.provider(), block_number, mode)
-                    .map_err(EthApiError::from)?)
+                    .map_err(EthApiError::from)?;
+                // The record step runs inside execution but is witness work, so it belongs with
+                // the collection phase rather than with the block's re-execution.
+                let witness_elapsed = step.elapsed() + record_elapsed;
+
+                tracing::debug!(
+                    target: "reth::witness::timing",
+                    block_number,
+                    us_execute = execute_elapsed.as_micros() as u64,
+                    us_witness = witness_elapsed.as_micros() as u64,
+                    "debug_executionWitness phases"
+                );
+
+                Ok(witness)
             })
-            .await
+            .await;
+
+        // Logged outside the spawned closure so it also covers acquiring the state provider and the
+        // hop on and off the blocking pool — the parts a caller pays for but the closure cannot see.
+        tracing::debug!(
+            target: "reth::witness::timing",
+            block_number,
+            us_total = started.elapsed().as_micros() as u64,
+            ok = witness.is_ok(),
+            "debug_executionWitness total"
+        );
+
+        witness
     }
 
     /// Returns the code associated with a given hash at the specified block ID. If no code is

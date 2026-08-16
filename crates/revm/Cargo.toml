@@ -26,6 +26,9 @@ alloy-rpc-types-debug = { workspace = true, optional = true }
 # revm
 revm.workspace = true
 
+# misc
+tracing.workspace = true
+
 [dev-dependencies]
 reth-trie.workspace = true
 reth-ethereum-forks.workspace = true
