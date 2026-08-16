@@ -181,6 +181,30 @@ struct Args {
     #[arg(long)]
     write_side_tables: bool,
 
+    /// Execute the block this many times against the parent *before* generating the witness,
+    /// discarding the results.
+    ///
+    /// Models a builder that has already executed these transactions as part of building the block
+    /// it is about to witness — the realistic case, and the upper bound on how much prior work can
+    /// warm the witness. It reads through the same `StateProviderDatabase` the witness does, so it
+    /// warms the same memory-mapped pages.
+    ///
+    /// Timed separately as `us_pre_execute` and never folded into any witness figure.
+    #[arg(long, default_value_t = 0)]
+    pre_execute: u32,
+
+    /// During `--pre-execute`, also compute the state root, as a builder does when sealing.
+    ///
+    /// This is the half that matters. Executing a block reads plain and hashed state *leaves*; it
+    /// never walks `AccountsTrie` / `StoragesTrie`. Only the state-root computation does — through
+    /// the same `DatabaseTrieCursorFactory` the witness uses. Since the trie step is ~99% of witness
+    /// cost, this flag is the difference between a warm-up that touches the right pages and one
+    /// that does not.
+    ///
+    /// `--pre-execute` alone models simulation; with this, a full build.
+    #[arg(long)]
+    pre_root: bool,
+
     /// Skip the stage-alignment preflight. You almost certainly do not want this.
     #[arg(long)]
     skip_preflight: bool,
@@ -231,6 +255,8 @@ struct Sample {
     t_encode: Duration,
     t_state_root: Duration,
     t_persist: Duration,
+    t_pre_execute: Duration,
+    pre_root: bool,
     t_save: Duration,
 }
 
@@ -294,6 +320,8 @@ impl Sample {
                     "us_encode": us(self.t_encode),
                     "us_state_root": us(self.t_state_root),
                     "us_persist": us(self.t_persist),
+                    "us_pre_execute": us(self.t_pre_execute),
+                    "pre_root": self.pre_root,
                     "us_save": us(self.t_save),
 
                     "us_witness_cold": us(self.witness_cold()),
@@ -525,6 +553,26 @@ fn measure(
 
     sample.gas_used = block.header().gas_used();
     sample.tx_count = block.body().transactions().count();
+
+    // Warm-up pass, if asked for. Deliberately uses its own state provider and executor so the
+    // measured path below starts exactly as it otherwise would; the only thing carried over is
+    // page-cache residency, which is the whole point.
+    if args.pre_execute > 0 {
+        let start = Instant::now();
+        for _ in 0..args.pre_execute {
+            let pre_state = factory.latest()?;
+            let pre_db = StateProviderDatabase::new(&pre_state);
+            let output =
+                evm_config.batch_executor(pre_db).execute_with_state_closure(&block, |_| {})?;
+
+            if args.pre_root {
+                let post = pre_state.hashed_post_state(&output.state);
+                let _ = pre_state.state_root_with_updates(post)?;
+            }
+        }
+        sample.t_pre_execute = start.elapsed();
+        sample.pre_root = args.pre_root;
+    }
 
     // Parent state. In lockstep this is `LatestStateProviderRef` over the plain state and trie
     // tables directly — no changeset overlay, which is exactly a builder's situation at the head.
