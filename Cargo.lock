@@ -9850,6 +9850,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie",
  "revm",
+ "tracing",
 ]
 
 [[package]]
@@ -14092,6 +14093,46 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "witness-bench"
+version = "2.5.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-debug",
+ "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth",
+ "clap",
+ "eyre",
+ "reqwest",
+ "reth-chainspec",
+ "reth-cli-commands",
+ "reth-consensus",
+ "reth-consensus-common",
+ "reth-db",
+ "reth-ethereum-cli",
+ "reth-ethereum-consensus",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-execution-types",
+ "reth-node-ethereum",
+ "reth-node-types",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-revm",
+ "reth-stages-types",
+ "reth-storage-api",
+ "reth-tasks",
+ "reth-tracing",
+ "reth-trie",
+ "reth-trie-common",
+ "serde_json",
+ "tracing",
+ "zstd",
 ]
 
 [[package]]
