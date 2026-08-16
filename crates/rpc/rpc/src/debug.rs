@@ -577,7 +577,8 @@ where
             .await;
 
         // Logged outside the spawned closure so it also covers acquiring the state provider and the
-        // hop on and off the blocking pool — the parts a caller pays for but the closure cannot see.
+        // hop on and off the blocking pool — the parts a caller pays for but the closure cannot
+        // see.
         tracing::debug!(
             target: "reth::witness::timing",
             block_number,
